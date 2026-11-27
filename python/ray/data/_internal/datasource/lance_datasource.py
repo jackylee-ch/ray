@@ -147,13 +147,11 @@ class _LanceBatchReader:
 
         # A task opens only the snapshots its descriptors reference. Their
         # file metadata and index caches share a single byte-bounded session.
-        return lru_cache(maxsize=len(self.versions))(
-            partial(
-                lance.dataset,
-                storage_options=self.storage_options,
-                session=lance.Session(),
-            )
-        )
+        open_dataset = partial(lance.dataset, storage_options=self.storage_options)
+        # Older PyLance versions provide snapshot scans without a session argument.
+        if hasattr(lance, "Session"):
+            open_dataset = partial(open_dataset, session=lance.Session())
+        return lru_cache(maxsize=len(self.versions))(open_dataset)
 
     def __getstate__(self):
         return {key: value for key, value in self.__dict__.items() if key != "_open"}

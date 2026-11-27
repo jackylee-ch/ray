@@ -121,6 +121,8 @@ def test_planned_lance_mid_scan_retry(fragmented_data, monkeypatch):
 def test_planned_lance_declines_ambiguous_branch_tag(tmp_path):
     path = str(tmp_path / "tbl.lance")
     main = lance.write_dataset(pa.table({"id": [0, 1]}), path)
+    if not hasattr(main, "create_branch"):
+        pytest.skip("This version of Lance has no branch-backed tags")
     branch = main.create_branch("work")
     branch.update({"id": "id + 10"})
     main.update({"id": "id + 20"})
@@ -138,6 +140,24 @@ def test_planned_lance_declines_ambiguous_branch_tag(tmp_path):
     with pytest.raises(ValueError, match="does not support planned read batches"):
         _plan(source, 1, 1)
     assert LanceDatasource(path, version=main.version).supports_read_batch_planning()
+
+
+def test_planned_lance_without_native_session(fragmented_data, monkeypatch):
+    path, values, _ = fragmented_data
+    source = LanceDatasource(path)
+    ranges = _plan(source, 3, 1)
+    open_dataset = lance.dataset
+
+    def legacy_open(uri, *, version, storage_options):
+        return open_dataset(uri, version=version, storage_options=storage_options)
+
+    monkeypatch.delattr(lance, "Session", raising=False)
+    monkeypatch.setattr(lance, "dataset", legacy_open)
+    assert [
+        v
+        for block in source.read_planned_batches(ranges)
+        for v in block["id"].to_pylist()
+    ] == values
 
 
 def test_planned_lance_relative_uri_uses_driver_directory(tmp_path, monkeypatch):
@@ -161,6 +181,14 @@ def test_planned_lance_empty_projection(fragmented_data):
     path, _, _ = fragmented_data
     source = LanceDatasource(path, columns=[], scanner_options={"batch_size": 1})
     ranges = _plan(source, 3, 1)
+    try:
+        next(iter(source.get_read_tasks(1)[0]()))
+    except ValueError as exc:
+        # Older Lance scanners reject empty projections on the ordinary read path.
+        assert "no columns were selected" in str(exc)
+        with pytest.raises(ValueError, match="no columns were selected"):
+            list(source.read_planned_batches(ranges))
+        return
     assert [
         (b.num_columns, b.num_rows) for b in source.read_planned_batches(ranges)
     ] == [(0, 3), (0, 1), (0, 3), (0, 1), (0, 1)]
