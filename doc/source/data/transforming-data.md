@@ -229,6 +229,61 @@ Increasing `batch_size` improves the performance of vectorized transformations a
 
 Use `batch_size="auto"` to let Ray Data automatically determine an appropriate batch size based on the size of your data. For GPU workloads, you must specify an explicit integer batch size. If you encounter OOM errors with an explicit batch size, try decreasing it.
 
+### Planning reproducible input batches for Lance
+
+Enable source-planned batches before constructing a Dataset when you need to identify
+the input to each invocation of the first batch UDF. For an ordered, unfiltered Lance
+scan, each input covers a half-open interval of live rows in a single fragment of a
+pinned snapshot. An integer `batch_size` determines the interval length. The last
+interval in each fragment can be shorter. With `None` or `"auto"`, Lance estimates
+a size per fragment from manifest metadata. Compressed bytes may underestimate
+the memory needed for large variable-width values. Use an explicit size when
+your UDF has a memory budget. A different task count can run the same
+set of intervals.
+
+```python
+import ray
+import pyarrow as pa
+from ray.data.datasource.planned_batch import (
+    get_current_read_batch,
+    iter_planned_read_batches,
+)
+
+def count_range(table):
+    span = get_current_read_batch()
+    return pa.table({"unit": [span.unit], "start": [span.start], "rows": [len(table)]})
+
+ray.data.DataContext.get_current().enable_planned_map_batches = True
+ds = ray.data.read_lance("events.lance", version=3).map_batches(
+    count_range, batch_size=2048, batch_format="pyarrow"
+)
+expected_count = sum(1 for span in iter_planned_read_batches(ds))
+results = ds.materialize()
+```
+
+`iter_planned_read_batches` enumerates the expected ranges from metadata before
+execution and raises `ValueError` for an ineligible plan. The feature supports a
+plain, synchronous task-pool function or generator immediately after a compatible
+read in a map-only pipeline. A Dataset method that introduces a batch map can
+occupy that first position. Later maps use their own batch settings. Use a
+numeric Lance version for repeatable runs. Scans using string tags follow
+ordinary batching because distinct branches can share the same numeric version.
+Fetching a fresh schema preserves the planned inputs. Limits, shuffles, configured
+row checkpointing and unsupported read or scheduling options use ordinary batching.
+Actions such as `take()` and `count()` can add a limit or aggregation to the plan.
+Use `materialize()` first when your function requires a range and you will run
+these actions on the result.
+`get_current_read_batch()` returns `None` outside the planned function. The default
+configuration retains ordinary batching, including the whole-block meaning of
+`batch_size=None`.
+
+For recovery, use the same backing store and dataset, pin its version, and keep
+the same batch sizing and transformation. Compare the full
+`(source, version, unit, start, stop)` identifiers with the ranges whose outputs
+your sink committed. Tasks can retry or finish out of order, and one invocation
+can emit zero or multiple rows. Observing the range inside the UDF identifies its
+input. Only the sink can confirm that it committed the resulting output.
+
 (stateful_transforms)=
 
 ## Stateful/Class-based Transforms

@@ -75,6 +75,9 @@ class ShuffleStrategy(str, enum.Enum):
 # * DEFAULT_OBJECT_STORE_MEMORY_LIMIT_FRACTION * 0.3 (default object store memory
 # fraction set by Ray core), assuming typical memory:core ratio of 4:1.
 DEFAULT_TARGET_MAX_BLOCK_SIZE = 128 * 1024 * 1024
+DEFAULT_BATCH_SIZE_BYTES = env_integer(
+    "RAY_DATA_DEFAULT_BATCH_SIZE_BYTES", 16 * 1024 * 1024
+)
 
 # We set a higher target block size because we have to materialize
 # all input blocks anyway, so there is no performance advantage to having
@@ -719,6 +722,15 @@ class DataContext:
         target_min_block_size: Ray Data avoids creating blocks smaller than this
             size in bytes on read. This takes precedence over
             ``read_op_min_num_blocks``.
+        enable_planned_map_batches: Allow a supporting datasource to determine
+            the input batches of a synchronous function passed to ``map_batches``
+            immediately after the read in a map-only pipeline. An explicit batch
+            size is the target number of source rows per batch. With ``None`` or
+            ``"auto"``, the datasource chooses the batch size. Enabling this can
+            change the batches observed by the function, including where short
+            batches occur. This applies to task-pool maps using default worker
+            resources and placement. Queries using a limit or a configured row
+            checkpoint continue to use ordinary batching. Defaults to ``False``.
         streaming_read_buffer_size: Buffer size when doing streaming reads from local or
             remote storage.
         enable_pandas_block: Whether pandas block format is enabled.
@@ -1070,6 +1082,7 @@ class DataContext:
     # `None` means the block size is infinite.
     target_max_block_size: Optional[int] = DEFAULT_TARGET_MAX_BLOCK_SIZE
     target_min_block_size: int = DEFAULT_TARGET_MIN_BLOCK_SIZE
+    enable_planned_map_batches: bool = field(default=False, kw_only=True)
     streaming_read_buffer_size: int = DEFAULT_STREAMING_READ_BUFFER_SIZE
     enable_pandas_block: bool = DEFAULT_ENABLE_PANDAS_BLOCK
     actor_prefetcher_enabled: bool = DEFAULT_ACTOR_PREFETCHER_ENABLED

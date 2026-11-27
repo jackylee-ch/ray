@@ -2558,6 +2558,20 @@ py_test(
 )
 
 py_test(
+    name = "test_lance_planned_batches",
+    size = "small",
+    srcs = ["tests/test_lance_planned_batches.py"],
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
+py_test(
     name = "test_lerobot",
     size = "medium",
     srcs = ["tests/datasource/test_lerobot.py"],

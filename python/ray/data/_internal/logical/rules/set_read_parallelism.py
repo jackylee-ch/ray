@@ -112,6 +112,18 @@ class SetReadParallelismRule(Rule):
         return plan
 
     def _apply(self, plan: PhysicalPlan, op: PhysicalOperator, logical_op: Read):
+        if logical_op.planned_map_batch_size is not None:
+            # The source distributes small range descriptors itself. Payload
+            # byte estimates and generic ReadTask counts describe a different grid.
+            parallelism, _, _ = _autodetect_parallelism(
+                logical_op.parallelism,
+                op.target_max_block_size_override
+                or op.data_context.target_max_block_size,
+                op.data_context,
+                logical_op.datasource,
+            )
+            plan.op_map[op] = logical_op.set_detected_parallelism(parallelism)
+            return
         estimated_in_mem_bytes = logical_op.infer_metadata().size_bytes
 
         (

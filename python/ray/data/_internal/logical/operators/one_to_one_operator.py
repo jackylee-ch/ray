@@ -132,6 +132,10 @@ class Limit(
         return self.input_dependencies[0].infer_metadata().input_files
 
 
+class _SchemaProbeLimit(Limit):
+    """A schema fetch may truncate output after planning the full UDF inputs."""
+
+
 @dataclass(frozen=True, repr=False, eq=False)
 class Download(AbstractOneToOne):
     """Logical operator for download operation.

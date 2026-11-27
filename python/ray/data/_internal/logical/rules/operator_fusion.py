@@ -40,6 +40,7 @@ from ray.data._internal.logical.operators import (
     AbstractUDFMap,
     MapBatches,
     RandomShuffle,
+    Read,
     Repartition,
     StreamingRepartition,
     Write,
@@ -332,6 +333,22 @@ class FuseOperators(Rule):
 
         down_logical_op = self._op_map[down_op]
         up_logical_op = self._op_map[up_op]
+
+        # A planned UDF turns descriptor rows into business rows. Size-based
+        # bundling and schema-dependent initialization downstream need the UDF's
+        # output, while a stateless map can still fuse across this boundary.
+        if (
+            up_op.data_context.enable_planned_map_batches
+            and isinstance(up_logical_op, AbstractUDFMap)
+            and isinstance(down_op, MapOperator)
+        ):
+            parent = up_logical_op.input_dependencies[0]
+            if isinstance(parent, Read) and parent.planned_map_batch_size is not None:
+                if (
+                    down_logical_op.min_rows_per_bundled_input is not None
+                    or down_op._on_start is not None
+                ):
+                    return False
 
         # An AllToAllOperator that already absorbed a map must not absorb another.
         # Map fusion runs first and collapses every fusable map chain, so a

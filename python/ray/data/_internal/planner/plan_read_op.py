@@ -76,11 +76,16 @@ def plan_read_op(
         ), "Read parallelism must be set by the optimizer before execution"
 
         # Get the original read tasks
-        read_tasks = op.datasource_or_legacy_reader.get_read_tasks(
-            parallelism,
-            per_task_row_limit=op.per_block_limit,
-            data_context=data_context,
-        )
+        if op.planned_map_batch_size is None:
+            read_tasks = op.datasource_or_legacy_reader.get_read_tasks(
+                parallelism,
+                per_task_row_limit=op.per_block_limit,
+                data_context=data_context,
+            )
+        else:
+            read_tasks = op.datasource.get_read_batch_tasks(
+                parallelism, op.planned_map_batch_size, data_context
+            )
 
         _warn_on_high_parallelism(parallelism, len(read_tasks))
 
@@ -116,6 +121,8 @@ def plan_read_op(
         [
             BlockMapTransformFn(
                 do_read,
+                # Range tables already have a bounded number of descriptors.
+                disable_block_shaping=op.planned_map_batch_size is not None,
                 output_block_size_option=OutputBlockSizeOption.of(
                     target_max_block_size=data_context.target_max_block_size,
                 ),

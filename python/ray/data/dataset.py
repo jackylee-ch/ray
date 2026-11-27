@@ -806,6 +806,9 @@ class Dataset:
                 explicit integer value, not ``"auto"`` or ``None``. Only use ``None``
                 if you intend to process entire blocks as batches. Otherwise,
                 prefer ``"auto"``, or an explicit batch size (e.g., ``1024``).
+                With ``DataContext.enable_planned_map_batches``, an eligible source
+                defines the first map's input ranges. Both ``None`` and ``"auto"``
+                ask it to estimate a range size from snapshot metadata.
             compute: The compute strategy to use for the map operation.
 
                 * If ``compute`` is not specified for a function, will use ``ray.data.TaskPoolStrategy()`` to launch concurrent tasks based on the available resources and number of input blocks.
@@ -886,8 +889,7 @@ class Dataset:
             ``batch_size``, Ray Data will bundle up many blocks as the input for one
             task, until their total size is equal to or greater than the given
             ``batch_size``.
-            If ``batch_size`` is not set, the bundling will not be performed. Each task
-            will receive entire input block as a batch.
+            With ordinary batching and no ``batch_size``, each input block is a batch.
 
         .. seealso::
 
@@ -4843,6 +4845,15 @@ class Dataset:
                     self.context,
                     DatasetStats(metadata={}, parent=None),
                 ).limit(1)
+            elif self.context.enable_planned_map_batches:
+                from ray.data._internal.logical.operators.one_to_one_operator import (
+                    _SchemaProbeLimit,
+                )
+
+                probe = _SchemaProbeLimit(limit=1, input_dependencies=[dag])
+                limited_ds = Dataset._from_parent(
+                    self, LogicalPlan(probe, self.context)
+                )
             else:
                 limited_ds = self.limit(1)
             iter_ref_bundles, _, executor = limited_ds._execute_to_iterator()

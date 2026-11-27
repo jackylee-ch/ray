@@ -13,6 +13,7 @@ from ray.data._internal.logical.interfaces import (
     PhysicalPlan,
     Rule,
 )
+from ray.data._internal.logical.operators.one_to_one_operator import _SchemaProbeLimit
 from ray.data._internal.logical.rules import (
     BindGeneratedIdColumn,
     CombineDownloads,
@@ -32,6 +33,7 @@ from ray.data._internal.logical.rules import (
     SetReadParallelismRule,
     TopNRewriteRule,
 )
+from ray.data._internal.logical.rules.plan_read_batches import PlanReadBatches
 from ray.util.annotations import DeveloperAPI
 
 _LOGICAL_RULESET = Ruleset(
@@ -133,24 +135,34 @@ class PhysicalOptimizer(Optimizer):
         return [rule_cls() for rule_cls in get_physical_ruleset()]
 
 
-def get_execution_plan(
-    logical_plan: LogicalPlan,
-) -> Tuple[PhysicalPlan, List["ExecutionCallback"]]:
-    """Get the physical execution plan for the provided logical plan.
+def _optimize_for_execution(logical_plan: LogicalPlan) -> LogicalPlan:
+    if isinstance(logical_plan.dag, _SchemaProbeLimit):
+        # The UDF may need its planned range to produce even its first row.
+        # Apply the probe limit after binding its inputs, so ordinary limit
+        # pushdown cannot change the rows or identity seen during inference.
+        (child,) = logical_plan.dag.input_dependencies
+        child_plan = LogicalPlan(child, logical_plan.context)
+        optimized_child = LogicalOptimizer().optimize(child_plan)
+        planned_child = PlanReadBatches().apply(optimized_child)
+        if planned_child is not optimized_child:
+            probe = logical_plan.dag._with_new_input_dependencies([planned_child.dag])
+            return LogicalPlan(probe, logical_plan.context)
 
-    This process has 3 steps:
-    (1) logical optimization: optimize logical operators.
-    (2) planning: convert logical to physical operators.
-    (3) physical optimization: optimize physical operators.
-    """
     # 1. Logical -> Logical (Optimized)
     optimized_logical_plan = LogicalOptimizer().optimize(logical_plan)
 
     # 2. Rewire Logical -> Logical (Optimized)
     logical_plan._dag = optimized_logical_plan.dag
 
-    # 3. Logical (Optimized) -> Physical
-    physical_plan, callbacks = create_planner().plan(optimized_logical_plan)
+    # Batch descriptors are private to this execution's Read -> MapBatches edge.
+    # A Dataset derived from this one can have a different consumer or a shuffle.
+    return PlanReadBatches().apply(optimized_logical_plan)
 
-    # 4. Physical (Optimized) -> Physical
+
+def get_execution_plan(
+    logical_plan: LogicalPlan,
+) -> Tuple[PhysicalPlan, List["ExecutionCallback"]]:
+    """Optimize the logical plan, plan physical operators, then optimize them."""
+    execution_plan = _optimize_for_execution(logical_plan)
+    physical_plan, callbacks = create_planner().plan(execution_plan)
     return PhysicalOptimizer().optimize(physical_plan), callbacks

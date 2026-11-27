@@ -49,6 +49,7 @@ from ray.data._internal.logical.operators import (
     MapBatches,
     MapRows,
     Project,
+    Read,
     StreamingRepartition,
 )
 from ray.data._internal.numpy_support import _is_valid_column_values
@@ -359,12 +360,27 @@ def plan_udf_map_op(
         compute=compute,
     )
 
+    planned = False
     if isinstance(op, MapBatches):
+        input_op = op.input_dependencies[0]
+        planned = (
+            isinstance(input_op, Read) and input_op.planned_map_batch_size is not None
+        )
+        transform = _generate_transform_fn_for_map_batches(fn)
+        if planned:
+            transform = _map_planned_read_batches(
+                transform,
+                input_op.datasource.get_read_batch_reader(),
+                op.batch_format,
+                op.zero_copy_batch,
+            )
         transform_fn = BatchMapTransformFn(
-            _generate_transform_fn_for_map_batches(fn),
-            batch_size=op.batch_size,
-            batch_format=op.batch_format,
-            zero_copy_batch=op.zero_copy_batch,
+            transform,
+            # Read adjacent descriptor rows together to allow a sequential scan.
+            # Each descriptor still triggers its own business UDF invocation.
+            batch_size=None if planned else op.batch_size,
+            batch_format="pyarrow" if planned else op.batch_format,
+            zero_copy_batch=True if planned else op.zero_copy_batch,
             output_block_size_option=output_block_size_option,
         )
 
@@ -394,6 +410,47 @@ def plan_udf_map_op(
         ray_remote_args=op.ray_remote_args,
         per_block_limit=op.per_block_limit,
     )
+
+
+def _map_planned_read_batches(transform, read_batches, batch_format, zero_copy_batch):
+    def apply(tables, ctx):
+        from ray.data._internal.block_batching.block_batching import batch_blocks
+        from ray.data.datasource.planned_batch import _current_range, iter_range_groups
+
+        for ranges in iter_range_groups(tables):
+
+            def checked_blocks():
+                for span, block in zip(ranges, read_batches(ranges), strict=True):
+                    if (
+                        BlockAccessor.for_block(block).num_rows()
+                        != span.stop - span.start
+                    ):
+                        raise ValueError(
+                            f"Source returned the wrong row count for {span}"
+                        )
+                    yield block
+
+            batches = batch_blocks(
+                checked_blocks(),
+                batch_size=None,
+                batch_format=batch_format,
+                ensure_copy=not zero_copy_batch,
+            )
+            for span, batch in zip(ranges, batches, strict=True):
+                results = iter(transform((batch,), ctx))
+                while True:
+                    # Scope the identity to user code, including generator
+                    # advancement. Fused downstream UDFs run outside it.
+                    token = _current_range.set(span)
+                    try:
+                        result = next(results)
+                    except StopIteration:
+                        break
+                    finally:
+                        _current_range.reset(token)
+                    yield result
+
+    return apply
 
 
 def _get_udf(

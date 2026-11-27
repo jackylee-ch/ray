@@ -17,7 +17,6 @@ from typing import (
     Union,
 )
 
-from ray._common.utils import env_integer
 from ray.data._internal.block_batching.block_batching import batch_blocks
 from ray.data._internal.execution.interfaces.task_context import (
     RerunPolicy,
@@ -31,10 +30,7 @@ from ray.data.block import (
     CustomOpStats,
     DataBatch,
 )
-
-_DEFAULT_BATCH_SIZE_BYTES: int = env_integer(
-    "RAY_DATA_DEFAULT_BATCH_SIZE_BYTES", 16 * 1024 * 1024  # 16 MiB
-)
+from ray.data.context import DEFAULT_BATCH_SIZE_BYTES
 
 # Allowed input/output data types for a MapTransformFn.
 Row = Dict[str, Any]
@@ -727,7 +723,7 @@ def _peek_first_nonempty_block(
 
 def _compute_auto_batch_size(
     blocks: Iterable[Block],
-    target_batch_size_bytes: int = _DEFAULT_BATCH_SIZE_BYTES,
+    target_batch_size_bytes: int = DEFAULT_BATCH_SIZE_BYTES,
 ) -> Tuple[Optional[int], Iterable[Block]]:
     """Peek at the first non-empty block to estimate the batch size to use for the
     'auto' batch_size option."""
@@ -750,7 +746,7 @@ class BatchMapTransformFn(MapTransformFn):
         batch_format: Optional[BatchFormat] = None,
         zero_copy_batch: bool = True,
         output_block_size_option: Optional[OutputBlockSizeOption] = None,
-        target_batch_size_bytes: int = _DEFAULT_BATCH_SIZE_BYTES,
+        target_batch_size_bytes: int = DEFAULT_BATCH_SIZE_BYTES,
         should_report_custom_op_stats: bool = False,
     ):
         super().__init__(

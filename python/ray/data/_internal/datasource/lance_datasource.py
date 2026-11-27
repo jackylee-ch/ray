@@ -1,13 +1,36 @@
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Union
+import os
+from dataclasses import dataclass, replace
+from functools import cached_property, lru_cache, partial
+from itertools import groupby
+from operator import attrgetter
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
+from urllib.parse import urlsplit
 
 import numpy as np
 
 from ray._common.retry import call_with_retry
 from ray.data._internal.object_extensions.arrow import raise_on_pickle_object_columns
-from ray.data._internal.util import _check_import
+from ray.data._internal.util import _check_import, iterate_with_retry
 from ray.data.block import BlockMetadata
-from ray.data.context import DataContext
+from ray.data.context import DEFAULT_BATCH_SIZE_BYTES, DataContext
 from ray.data.datasource.datasource import Datasource, ReadTask
+from ray.data.datasource.planned_batch import (
+    RANGE_SCHEMA,
+    ReadBatchRange,
+    SupportsReadBatchPlanning,
+    range_blocks,
+)
 
 if TYPE_CHECKING:
     import pyarrow
@@ -37,8 +60,130 @@ _ROW_COUNT_PRESERVING_SCANNER_OPTIONS = {
     "disable_scoring_autoprojection",
 }
 
+# These options also preserve the order of live rows and do not inspect a
+# scan's physical grouping (unlike, for example, scan_stats_callback).
+_RANGE_SCANNER_OPTIONS = {
+    "columns",
+    "scan_in_order",
+    "batch_size",
+    "batch_size_bytes",
+    "batch_readahead",
+    "fragment_readahead",
+    "io_buffer_size",
+    "use_stats",
+    "late_materialization",
+    "blob_handling",
+    "with_row_id",
+    "with_row_address",
+    "strict_batch_size",
+}
 
-class LanceDatasource(Datasource):
+
+@dataclass(frozen=True)
+class _LanceBatchSpan:
+    rows: ReadBatchRange
+    batch_size: int
+    files: Tuple[str, ...]
+
+    @property
+    def num_batches(self) -> int:
+        return (
+            self.rows.stop - self.rows.start + self.batch_size - 1
+        ) // self.batch_size
+
+
+def _read_range_descriptions(spans):
+    import pyarrow as pa
+
+    blocks = []
+    count = 0
+    for span in spans:
+        rows = span.rows
+        for block in range_blocks(
+            rows.source,
+            rows.version,
+            rows.unit,
+            rows.stop,
+            span.batch_size,
+            start=rows.start,
+        ):
+            blocks.append(block)
+            count += block.num_rows
+            if count >= 1024:
+                yield blocks[0] if len(blocks) == 1 else pa.concat_tables(blocks)
+                blocks = []
+                count = 0
+    if blocks:
+        yield blocks[0] if len(blocks) == 1 else pa.concat_tables(blocks)
+
+
+def _make_range_read_task(spans, num_ranges):
+    def read_ranges():
+        yield from _read_range_descriptions(spans)
+
+    return ReadTask(
+        read_ranges,
+        BlockMetadata(
+            num_rows=num_ranges,
+            size_bytes=None,
+            exec_stats=None,
+            input_files=[f for span in spans for f in span.files],
+        ),
+        schema=RANGE_SCHEMA,
+    )
+
+
+@dataclass
+class _LanceBatchReader:
+    versions: Dict[str, str]
+    storage_options: Optional[Dict[str, str]]
+    scanner_options: Dict[str, Any]
+    schema: "pyarrow.Schema"
+    retry_params: Dict[str, Any]
+
+    @cached_property
+    def _open(self):
+        import lance
+
+        # A task opens only the snapshots its descriptors reference. Their
+        # file metadata and index caches share a single byte-bounded session.
+        return lru_cache(maxsize=len(self.versions))(
+            partial(
+                lance.dataset,
+                storage_options=self.storage_options,
+                session=lance.Session(),
+            )
+        )
+
+    def __getstate__(self):
+        return {key: value for key, value in self.__dict__.items() if key != "_open"}
+
+    def __call__(self, ranges: Sequence[ReadBatchRange]) -> Iterator["pyarrow.Table"]:
+        for (uri, version), group in groupby(
+            ranges, key=attrgetter("source", "version")
+        ):
+            if self.versions.get(uri) != version:
+                raise ValueError(
+                    f"Range does not belong to this Lance snapshot: {(uri, version)}"
+                )
+            dataset = call_with_retry(
+                partial(self._open, uri, version=int(version)), **self.retry_params
+            )
+            for fragments, adjacent in _adjacent_ranges(dataset, group):
+                yield from iterate_with_retry(
+                    partial(
+                        _scan_range_span,
+                        dataset,
+                        fragments,
+                        adjacent,
+                        self.scanner_options,
+                        self.schema,
+                    ),
+                    **self.retry_params,
+                )
+
+
+class LanceDatasource(Datasource, SupportsReadBatchPlanning):
     """Lance datasource, for reading Lance dataset."""
 
     def __init__(
@@ -72,6 +217,8 @@ class LanceDatasource(Datasource):
             lance.dataset(uri=u, version=version, storage_options=storage_options)
             for u in self.uris
         ]
+        self._version = version
+        self._driver_working_dir = os.getcwd()
         # Use the dataset-level (not fragment-level) schema: Lance fills nulls
         # for columns missing from older fragments under schema evolution, so
         # only the dataset schema is a correct output contract.
@@ -98,6 +245,125 @@ class LanceDatasource(Datasource):
 
     def supports_predicate_pushdown(self) -> bool:
         return True
+
+    @cached_property
+    def _batch_uris(self) -> List[str]:
+        # A local relative path belongs to the driver's original working directory.
+        return [
+            ds.uri
+            if urlsplit(ds.uri).scheme or os.path.isabs(ds.uri)
+            else os.path.realpath(os.path.join(self._driver_working_dir, ds.uri))
+            for ds in self.lance_datasets
+        ]
+
+    def supports_read_batch_planning(self) -> bool:
+        # Only plain, ordered scans have deterministic fragment-local live offsets.
+        # Arbitrary scanner options can filter, reorder or duplicate rows.
+        options = self.scanner_options
+        return (
+            self._predicate_expr is None
+            # A tag can point into a branch whose numeric version and public
+            # URI coincide with a different snapshot of the main branch.
+            and (self._version is None or isinstance(self._version, int))
+            and len(set(self._batch_uris)) == len(self.lance_datasets)
+            and options.get("scan_in_order") in (None, True)
+            and not isinstance(options.get("columns"), dict)
+            and all(
+                value is None or key in _RANGE_SCANNER_OPTIONS
+                for key, value in options.items()
+            )
+        )
+
+    def get_read_batch_tasks(
+        self,
+        parallelism: int,
+        batch_size: Union[int, Literal["auto"]],
+        data_context: DataContext,
+    ) -> List[ReadTask]:
+        if not self.supports_read_batch_planning():
+            raise ValueError("This Lance scan does not support planned read batches")
+        if batch_size != "auto" and batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        units = []
+        for uri, dataset in zip(self._batch_uris, self.lance_datasets):
+            for fragment in dataset.get_fragments():
+                num_rows = fragment.count_rows()
+                if not num_rows:
+                    continue
+                files = fragment.data_files()
+                if batch_size == "auto":
+                    # File sizes are stable manifest metadata. Bound the estimate for
+                    # highly compressed data and manifests without file sizes.
+                    size_bytes = sum(
+                        getattr(f, "file_size_bytes", 0) or 0 for f in files
+                    )
+                    rows_per_batch = min(
+                        8192,
+                        max(
+                            1, DEFAULT_BATCH_SIZE_BYTES * num_rows // max(1, size_bytes)
+                        ),
+                    )
+                else:
+                    rows_per_batch = batch_size
+                units.append(
+                    _LanceBatchSpan(
+                        ReadBatchRange(
+                            uri,
+                            str(dataset.version),
+                            str(fragment.metadata.id),
+                            0,
+                            num_rows,
+                        ),
+                        rows_per_batch,
+                        tuple(f.path() for f in files),
+                    )
+                )
+
+        # Partition the descriptor stream arithmetically: O(fragments + read tasks)
+        # driver space, including when a single fragment contains millions of batches.
+        total = sum(unit.num_batches for unit in units)
+        if not total:
+            return []
+        target = (total - 1) // max(1, parallelism) + 1
+        tasks = []
+        spans = []
+        count = 0
+        for unit in units:
+            start = 0
+            while start < unit.rows.stop:
+                stop = min(unit.rows.stop, start + (target - count) * unit.batch_size)
+                span = replace(unit, rows=replace(unit.rows, start=start, stop=stop))
+                spans.append(span)
+                count += span.num_batches
+                start = stop
+                if count == target or (unit is units[-1] and stop == unit.rows.stop):
+                    tasks.append(_make_range_read_task(spans, count))
+                    spans = []
+                    count = 0
+        return tasks
+
+    def read_planned_batches(
+        self, ranges: Sequence[ReadBatchRange]
+    ) -> Iterator["pyarrow.Table"]:
+        yield from self.get_read_batch_reader()(ranges)
+
+    @cached_property
+    def _batch_reader(self) -> _LanceBatchReader:
+        if not self.supports_read_batch_planning():
+            raise ValueError("This Lance scan does not support planned read batches")
+        return _LanceBatchReader(
+            {
+                uri: str(ds.version)
+                for uri, ds in zip(self._batch_uris, self.lance_datasets)
+            },
+            self.storage_options,
+            self.scanner_options,
+            self._schema,
+            self._retry_params,
+        )
+
+    def get_read_batch_reader(self) -> _LanceBatchReader:
+        return self._batch_reader
 
     def get_read_tasks(
         self,
@@ -244,6 +510,84 @@ def _read_fragments_with_retry(
     )
 
 
+def _adjacent_ranges(dataset, ranges):
+    """Preserve Lance's fragment readahead when adjacent ranges share a scan."""
+    fragments = []
+    adjacent = []
+    previous = None
+    fragment_rows = 0
+    for unit, group in groupby(ranges, key=attrgetter("unit")):
+        fragment = dataset.get_fragment(int(unit))
+        if fragment is None or str(fragment.metadata.id) != unit:
+            raise ValueError(f"Lance snapshot has no fragment {unit}")
+        num_rows = fragment.count_rows()
+        for item in group:
+            if item.stop > num_rows:
+                raise ValueError(
+                    f"Range exceeds the number of live fragment rows: {item}"
+                )
+            if previous is not None and previous.unit == unit:
+                consecutive = previous.stop == item.start
+            else:
+                consecutive = (
+                    previous is not None
+                    and int(previous.unit) < int(unit)
+                    and previous.stop == fragment_rows
+                    and item.start == 0
+                )
+            if adjacent and not consecutive:
+                yield fragments, adjacent
+                fragments, adjacent = [], []
+            if not fragments or fragments[-1] is not fragment:
+                fragments.append(fragment)
+            adjacent.append(item)
+            previous = item
+        fragment_rows = num_rows
+    if adjacent:
+        yield fragments, adjacent
+
+
+def _scan_range_span(dataset, fragments, ranges, options, schema):
+    """Read adjacent ranges through one scanner without copying Arrow buffers."""
+    import pyarrow as pa
+
+    opts = dict(
+        options,
+        fragments=fragments,
+        scan_in_order=True,
+        offset=ranges[0].start,
+        limit=sum(item.stop - item.start for item in ranges),
+    )
+    blocks = _scan_lance_dataset(dataset, opts, schema)
+    block = None
+    offset = 0
+    for item in ranges:
+        remaining = item.stop - item.start
+        pieces = []
+        while remaining:
+            if block is None or offset == block.num_rows:
+                block = next(blocks, None)
+                if block is None:
+                    raise ValueError(
+                        f"Lance snapshot ended before planned range {item}"
+                    )
+                offset = 0
+            n = min(remaining, block.num_rows - offset)
+            if n:
+                pieces.append(block if n == block.num_rows else block.slice(offset, n))
+                offset += n
+                remaining -= n
+        if len(pieces) == 1:
+            yield pieces[0]
+        elif pieces[0].num_columns == 0:
+            # concat_tables loses the row count for a zero-column projection.
+            yield pa.Table.from_batches(
+                [batch for piece in pieces for batch in piece.to_batches()]
+            )
+        else:
+            yield pa.concat_tables(pieces)
+
+
 def _read_fragments(
     dataset_fragment_groups: List[Tuple[Any, List[int]]],
     scanner_options,
@@ -254,20 +598,21 @@ def _read_fragments(
     NOTE: Use fragment ids, instead of fragments as parameter, because pickling
     LanceFragment is expensive.
     """
-    import pyarrow
-
     for lance_ds, fragment_ids in dataset_fragment_groups:
         fragments = [lance_ds.get_fragment(id) for id in fragment_ids]
         task_scanner_options = dict(scanner_options)
         task_scanner_options["fragments"] = fragments
-        scanner = lance_ds.scanner(**task_scanner_options)
-        for batch in scanner.to_reader():
-            table = pyarrow.Table.from_batches([batch])
-            # When you unpickle untrusted data, attackers can execute arbitrary code. To
-            # avoid exposing our users, raise unless the user has explicitly opted in.
-            raise_on_pickle_object_columns(table)
-            table = _fill_missing_columns(table, schema, task_scanner_options)
-            yield table
+        yield from _scan_lance_dataset(lance_ds, task_scanner_options, schema)
+
+
+def _scan_lance_dataset(dataset, scanner_options, schema):
+    import pyarrow as pa
+
+    for batch in dataset.scanner(**scanner_options).to_reader():
+        table = pa.Table.from_batches([batch])
+        # Validate each native batch before exposing or slicing its rows.
+        raise_on_pickle_object_columns(table)
+        yield _fill_missing_columns(table, schema, scanner_options)
 
 
 def _fill_missing_columns(table, schema, scanner_options) -> "pyarrow.Table":

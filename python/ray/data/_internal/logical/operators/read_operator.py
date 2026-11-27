@@ -1,7 +1,17 @@
 import functools
 import math
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Set,
+    Union,
+)
 
 from ray.data._internal.compute import ComputeStrategy
 from ray.data._internal.datasource_v2.common.pushdown_utils import (
@@ -72,6 +82,8 @@ class Read(
     min_rows_per_bundled_input: Optional[int] = field(init=False, default=None)
     ray_remote_args_fn: None = field(init=False, default=None)
     per_block_limit: Optional[int] = None
+    # On the execution-only copy of a Read feeding a planned MapBatches.
+    planned_map_batch_size: Optional[Union[int, Literal["auto"]]] = None
     _input_dependencies: list = field(init=False, repr=False, default_factory=list)
 
     def __post_init__(self):
